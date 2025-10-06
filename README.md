@@ -1,5 +1,9 @@
 # Ch-En-Translation
 ## about
+
+Using the Transformer framework  
+NLP model  
+
 This model is designed to visualize the transformer training process  
 Still in the production stage
 
