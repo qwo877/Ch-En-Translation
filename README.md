@@ -4,7 +4,7 @@ This model is designed to visualize the transformer training process
 Still in the production stage
 
 ## structure
-make_small_sample : Dataset sources and preliminary processing  
+make_data_set : Dataset sources and preliminary processing  
 data              : Data processing  
 model             : Model construction  
 train             : Model training  
