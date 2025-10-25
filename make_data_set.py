@@ -1,3 +1,4 @@
+#make_data_set
 import os
 import csv
 import shutil
@@ -18,7 +19,7 @@ LINKS_URLS = [
 # 語言代碼（Tatoeba 用 ISO639-3）— 英文是 "eng"，中文常見為 "cmn" (Mandarin)，也可能看到 "zho"
 EN_CODES = {"eng"}
 ZH_CODES = {"cmn", "zho", "chi", "cmn-Hant", "cmn-Hans"}
-MAX_PAIRS = 25_000     # 取出最多多少對
+MAX_PAIRS = 100_000     # 取出最多多少對
 MIN_CHAR_LEN = 1        # 最短字元數
 MAX_CHAR_LEN = 300      # 最長字元數
 TRAIN_RATIO = 0.90

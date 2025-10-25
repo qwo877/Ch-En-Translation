@@ -4,25 +4,28 @@ import numpy as np
 import time
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from data import build_data_loaders, r_parallel, tokenize_en, tokenize_zh
+from data import build_data_loaders, tokenize_en
 from model import TfMod, masks
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
+from tqdm import tqdm
+import sacrebleu
+import os
 # ---------- 設定 ----------
 DR = "data"
-NE = 30
+NE = 50
 BZ = 32
-D_MODEL = 512
+D_MODEL = 256
 N_HEADS = 8
-N_LAYERS = 6
-D_FF = 2048
+N_LAYERS = 4
+D_FF = 1024
 WS = 4000
 DEVICE = torch.device("cuda")
 save_path = "transformer_model.pt"
+LABEL_SMOOTH = 0.1
 # -------------------------
-
 def get_lr(d_mod, w):
     def lr_step(step):
         step = max(step, 1)
@@ -108,14 +111,14 @@ def evaluate(mod, it, criterion, src_pad_idx, tgt_pad_idx, device):
             epoch_loss += loss.item()
     return epoch_loss / len(it)
 
-def load_model_for_inference(path=save_path, device=DEVICE):
+def inference(path=save_path, device=DEVICE):
     ckpt = torch.load(path, map_location=device)
     src_vocab = ckpt["src_vocab"]
     tgt_vocab = ckpt["tgt_vocab"]
     model_state = ckpt["model_state"]
-    model = TfMod(len(src_vocab["itos"]), len(tgt_vocab["itos"])).to(device)
+    model = TfMod(len(src_vocab["itos"]), len(tgt_vocab["itos"]),
+                  d_model=D_MODEL, num_heads=N_HEADS, num_layers=N_LAYERS, d_ff=D_FF).to(device)
     model.load_state_dict(model_state)
-    # set padding_idx to match vocab
     src_pad_idx = src_vocab["stoi"].get("<pad>", 0)
     tgt_pad_idx = tgt_vocab["stoi"].get("<pad>", 0)
     model.src_emb.padding_idx = src_pad_idx
@@ -123,13 +126,15 @@ def load_model_for_inference(path=save_path, device=DEVICE):
     model.eval()
     return model, src_vocab, tgt_vocab
 
-def translate_sentence(model, sentence, src_vocab, tgt_vocab, max_len=50, device=DEVICE):
+def test(model, sentence, src_vocab, tgt_vocab, max_len=50, device=DEVICE):
     model.eval()
-    tokens = ["<sos>"] + [tok.text.lower() for tok in tokenize_en(sentence)] + ["<eos>"]
-    src_ids = [src_vocab["stoi"].get(tok, src_vocab["stoi"]["<unk>"]) for tok in tokens]
+    # tokenize_en 已回傳 string token list，因此直接使用；並把 token 轉小寫以一致
+    tokens = ["<sos>"] + [tok.lower() for tok in tokenize_en(sentence)] + ["<eos>"]
+    src_ids = [src_vocab["stoi"].get(tok, src_vocab["stoi"].get("<unk>", 1)) for tok in tokens]
     src_tensor = torch.LongTensor(src_ids).unsqueeze(0).to(device)  # (1, src_len)
-    # encoder
-    src_mask, _ = masks(src_tensor, src_tensor, src_vocab["stoi"]["<pad>"], tgt_vocab["stoi"]["<pad>"], device=device)
+    # encoder: 用 dummy trg 產生正確的 src_mask
+    dummy_trg = torch.LongTensor([[tgt_vocab["stoi"].get("<sos>", 1)]]).to(device)
+    src_mask, _ = masks(src_tensor, dummy_trg, src_vocab["stoi"].get("<pad>",0), tgt_vocab["stoi"].get("<pad>",0), device=device)
     with torch.no_grad():
         enc_out = model.src_emb(src_tensor) * math.sqrt(model.d_model)
         enc_out = model.pos_enc(enc_out)
@@ -137,10 +142,10 @@ def translate_sentence(model, sentence, src_vocab, tgt_vocab, max_len=50, device
             enc_out = layer(enc_out, src_mask)
 
     # decode step by step
-    trg_ids = [tgt_vocab["stoi"]["<sos>"]]
+    trg_ids = [tgt_vocab["stoi"].get("<sos>", 1)]
     for i in range(max_len):
         trg_tensor = torch.LongTensor(trg_ids).unsqueeze(0).to(device)
-        _, tgt_mask = masks(src_tensor, trg_tensor, src_vocab["stoi"]["<pad>"], tgt_vocab["stoi"]["<pad>"], device=device)
+        _, tgt_mask = masks(src_tensor, trg_tensor, src_vocab["stoi"].get("<pad>",0), tgt_vocab["stoi"].get("<pad>",0), device=device)
         dec_in = model.tgt_emb(trg_tensor) * math.sqrt(model.d_model)
         dec_in = model.pos_enc(dec_in)
         dec_out = dec_in
@@ -149,7 +154,7 @@ def translate_sentence(model, sentence, src_vocab, tgt_vocab, max_len=50, device
         output = model.fc_out(dec_out)  # (1, cur_len, vocab)
         next_token = output.argmax(-1)[:, -1].item()
         trg_ids.append(next_token)
-        if next_token == tgt_vocab["stoi"]["<eos>"]:
+        if next_token == tgt_vocab["stoi"].get("<eos>", -1):
             break
     return [tgt_vocab["itos"][i] for i in trg_ids]
 
@@ -205,18 +210,77 @@ def get_cm(mod, dataloader, src_vocab, tgt_vocab, device, src_pad_idx, tgt_pad_i
         cm = confusion_matrix(all_true, all_pred, labels=list(range(len(labels))))
     return cm, labels
 
-def plot_confusion_matrix(cm, labels, figsize=(10,8)):
-    plt.figure(figsize=figsize)
-    plt.imshow(cm, interpolation='nearest')
-    plt.title("Token-level Confusion Matrix (top tokens)")
-    plt.colorbar()
-    tick_marks = np.arange(len(labels))
-    plt.xticks(tick_marks, labels, rotation=90)
-    plt.yticks(tick_marks, labels)
-    plt.xlabel("predicted")
-    plt.ylabel("true")
-    plt.tight_layout()
-    plt.show()
+def generate_and_write_hyps_refs(model, dataloader, src_vocab, tgt_vocab, device, out_hyp="hyps.txt", out_ref="refs.txt", max_len=80):
+    model.eval()
+    hyps = []
+    refs = []
+    # dataloader yields (src_batch, tgt_batch)
+    with torch.no_grad():
+        for src_batch, tgt_batch in tqdm(dataloader, desc="Generate"):
+            B = src_batch.size(0)
+            # 對每個 sample 用 translate_sentence (簡單方式)，可慢但穩定
+            for i in range(B):
+                # 構造 src_text（依你的 tokenizer 恢復）
+                src_ids = src_batch[i].cpu().tolist()
+                # 移除 pad
+                src_ids = [x for x in src_ids if x != src_vocab["stoi"]["<pad>"]]
+                # 轉回 token 字串
+                # 若 src 原先是英文 tokenized by words/regex，拼接時用空格
+                src_tokens = [src_vocab["itos"][idx] for idx in src_ids]
+                src_text = " ".join([tok for tok in src_tokens if tok not in ("<sos>","<eos>","<pad>")])
+                pred_tokens = test(model, src_text, src_vocab, tgt_vocab, max_len=max_len, device=device)
+                # 轉為句子（中文通常直接 join）
+                pred_sent = "".join([t for t in pred_tokens if t not in ("<sos>","<eos>","<pad>")])
+                # 參考答案
+                tgt_ids = tgt_batch[i].cpu().tolist()
+                ref_tokens = [tgt_vocab["itos"][idx] for idx in tgt_ids if idx not in (tgt_vocab["stoi"]["<pad>"], tgt_vocab["stoi"]["<sos>"], tgt_vocab["stoi"]["<eos>"])]
+                ref_sent = "".join(ref_tokens)
+                hyps.append(pred_sent.strip())
+                refs.append(ref_sent.strip())
+    # 寫檔
+    with open(out_hyp, "w", encoding="utf-8") as fh:
+        for s in hyps: fh.write(s + "\n")
+    with open(out_ref, "w", encoding="utf-8") as fr:
+        for s in refs: fr.write(s + "\n")
+    print(f"Saved {out_hyp} and {out_ref} (total {len(hyps)})")
+    return out_hyp, out_ref
+
+def compute_bleu_with_sacrebleu(hyp_file, ref_file):
+
+    with open(hyp_file, "r", encoding="utf-8") as fh:
+        hyps = [l.strip() for l in fh]
+    with open(ref_file, "r", encoding="utf-8") as fr:
+        refs = [l.strip() for l in fr]
+    bleu = sacrebleu.corpus_bleu(hyps, [refs])
+    print("SacreBLEU:", bleu.score)
+    return bleu.score
+def sample_and_print_examples(model, dataloader, src_vocab, tgt_vocab, device, n=20, max_len=80):
+    model.eval()
+    printed = 0
+    with torch.no_grad():
+        for src_batch, tgt_batch in dataloader:
+            B = src_batch.size(0)
+            for i in range(B):
+                if printed >= n:
+                    return
+                # src -> text
+                src_ids = src_batch[i].cpu().tolist()
+                src_ids = [x for x in src_ids if x != src_vocab["stoi"]["<pad>"]]
+                src_tokens = [src_vocab["itos"][idx] for idx in src_ids]
+                src_text = " ".join([tok for tok in src_tokens if tok not in ("<sos>","<eos>","<pad>")])
+                pred_tokens = test(model, src_text, src_vocab, tgt_vocab, max_len=max_len, device=device)
+                pred_sent = "".join([t for t in pred_tokens if t not in ("<sos>","<eos>","<pad>")])
+                tgt_ids = tgt_batch[i].cpu().tolist()
+                ref_tokens = [tgt_vocab["itos"][idx] for idx in tgt_ids if idx not in (tgt_vocab["stoi"]["<pad>"], tgt_vocab["stoi"]["<sos>"], tgt_vocab["stoi"]["<eos>"])]
+                ref_sent = "".join(ref_tokens)
+                print("=== Example", printed+1, "===")
+                print("SRC:", src_text)
+                print("REF:", ref_sent)
+                print("PRED:", pred_sent)
+                print()
+                printed += 1
+    print("Done samples.")
+
 
 
 def main():
@@ -233,8 +297,9 @@ def main():
     model.tgt_emb.padding_idx = tgt_pad_idx
 
     #loss/optimizer/scheduler
-    criterion = nn.CrossEntropyLoss(ignore_index=tgt_pad_idx)
-    optimizer = optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-9)
+    criterion = nn.CrossEntropyLoss(ignore_index=tgt_pad_idx, label_smoothing=LABEL_SMOOTH)
+    optimizer = AdamW(model.parameters(), betas=(0.9, 0.98), eps=1e-9, weight_decay=0.0)
+
     lr_lambda = get_lr(D_MODEL, WS)
     scheduler = LambdaLR(optimizer, lr_lambda)
     
@@ -260,8 +325,58 @@ def main():
                 "tgt_vocab": tgt_vocab
             }, save_path)
         print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Val Loss: {valid_loss:.4f} | Time: {end_time-start_time:.1f}s")
-    cm, labels = get_cm(model, valid_loader, src_vocab, tgt_vocab, DEVICE, src_pad_idx, tgt_pad_idx, top_k=40)
-    plot_confusion_matrix(cm, labels)
+
+    max_samples = 500
+    if os.path.exists(save_path):
+        print("載入 best checkpoint 供評估...")
+        eval_model, src_vocab_ckpt, tgt_vocab_ckpt = inference(path=save_path, device=DEVICE)
+        # 若你希望使用 checkpoint 的 vocab，則把 src_vocab/tgt_vocab 換成 _ckpt
+        eval_src_vocab, eval_tgt_vocab = src_vocab_ckpt, tgt_vocab_ckpt
+    else:
+        print("未找到 checkpoint，使用目前記憶體中的 model 供評估。")
+        eval_model = model
+        eval_src_vocab, eval_tgt_vocab = src_vocab, tgt_vocab
+    def generate_and_write_hyps_refs_with_limit(model, dataloader, src_vocab, tgt_vocab, device, out_hyp="hyps.txt", out_ref="refs.txt", max_len=80, max_samples=None):
+        model.eval()
+        hyps = []
+        refs = []
+        count = 0
+        with torch.no_grad():
+            for src_batch, tgt_batch in tqdm(dataloader, desc="Generate"):
+                B = src_batch.size(0)
+                for i in range(B):
+                    if max_samples is not None and count >= max_samples:
+                        break
+                    src_ids = src_batch[i].cpu().tolist()
+                    src_ids = [x for x in src_ids if x != src_vocab["stoi"].get("<pad>",0)]
+                    src_tokens = [src_vocab["itos"][idx] for idx in src_ids]
+                    src_text = " ".join([tok for tok in src_tokens if tok not in ("<sos>","<eos>","<pad>")])
+                    pred_tokens = test(eval_model, src_text, src_vocab, tgt_vocab, max_len=max_len, device=device)
+                    pred_sent = "".join([t for t in pred_tokens if t not in ("<sos>","<eos>","<pad>")])
+                    tgt_ids = tgt_batch[i].cpu().tolist()
+                    ref_tokens = [tgt_vocab["itos"][idx] for idx in tgt_ids if idx not in (tgt_vocab["stoi"].get("<pad>",0), tgt_vocab["stoi"].get("<sos>",1), tgt_vocab["stoi"].get("<eos>",2))]
+                    ref_sent = "".join(ref_tokens)
+                    hyps.append(pred_sent.strip())
+                    refs.append(ref_sent.strip())
+                    count += 1
+                if max_samples is not None and count >= max_samples:
+                    break
+        with open("hyps.txt", "w", encoding="utf-8") as fh:
+            for s in hyps: fh.write(s + "\n")
+        with open("refs.txt", "w", encoding="utf-8") as fr:
+            for s in refs: fr.write(s + "\n")
+        print(f"Saved hyps.txt and refs.txt (total {len(hyps)})")
+        return "hyps.txt", "refs.txt"
+
+    hyp_file, ref_file = generate_and_write_hyps_refs_with_limit(eval_model, valid_loader, eval_src_vocab, eval_tgt_vocab, DEVICE, max_len=80, max_samples=max_samples)
+    try:
+        bleu_score = compute_bleu_with_sacrebleu(hyp_file, ref_file)
+    except Exception as e:
+        print("計算 BLEU 發生錯誤或缺少 sacrebleu:", e)
+        bleu_score = None
+
+    print("\n--- 抽樣 檢視 ---")
+    sample_and_print_examples(eval_model, valid_loader, eval_src_vocab, eval_tgt_vocab, DEVICE, n=20, max_len=80)
     #損失曲線
     plt.plot(train_losses, label="train")
     plt.plot(valid_losses, label="valid")
@@ -273,3 +388,25 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+'''針對 70k 資料的具體 config（建議）
+
+模型：Encoder/Decoder 各 4 層（N=4）
+
+d_model = 256，heads=8（head_dim=32）
+
+d_ff = 1024（≈4×d_model）
+
+vocab = 32k（shared or separate）
+
+dropout = 0.1，label smoothing = 0.1
+
+batch tokens ≈ 4096（用 gradient accumulation 若 VRAM 不足）
+
+optimizer = AdamW，lr schedule: warmup 4000 steps + inverse sqrt decay，peak lr ≈ 5e-4（從頭訓練）
+
+epochs：30–100（但用 validation 做 early stop）
+
+gradient clipping = 1.0
+'''

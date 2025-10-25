@@ -15,7 +15,7 @@ except Exception:
 # --- 設定 ---
 DIR = "data"
 MIN_F = 2
-BZ = 64
+BZ = 32
 # ------------------------------
 
 SPECIALS = ["<pad>", "<unk>", "<sos>", "<eos>"]
