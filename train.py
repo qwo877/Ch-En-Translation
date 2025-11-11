@@ -13,6 +13,7 @@ from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
 import sacrebleu
 import os
+import torch.nn.functional as F
 # ---------- 設定 ----------
 DR = "data"
 NE = 50
@@ -36,7 +37,7 @@ def get_lr(d_mod, w):
 # scheduler 學習率
 # src_pad_idx 輸入序列
 # tgt_pad_idx 輸出
-def t_epoch(mod, it, optimizer, criterion, scheduler,src_pad_idx, tgt_pad_idx, device,to=100):
+def t_epoch(mod, it, optimizer, criterion, scheduler, src_pad_idx, tgt_pad_idx, device, to=100, scheduled_sampling_prob=0.0):
     #訓練一個 epoch,並定期印出中途過程 (loss, avg_loss, lr, elapsed)。
     #- src_pad_idx, tgt_pad_idx, device: 用在 generate_masks 與 loss(ignore_index)
     #- to: 每多少 step 印一次
@@ -55,6 +56,13 @@ def t_epoch(mod, it, optimizer, criterion, scheduler,src_pad_idx, tgt_pad_idx, d
         # prepare decoder input (remove last token) and target (remove first <sos>)
         input_tgt = tgt[:, :-1]
         target = tgt[:, 1:]
+
+        # Scheduled Sampling: 隨機選擇使用模型預測或真實標籤作為輸入
+        if scheduled_sampling_prob > 0.0 and torch.rand(1).item() < scheduled_sampling_prob:
+            with torch.no_grad():
+                output = mod(src, input_tgt, src_mask=None, tgt_mask=None)
+                input_tgt = output.argmax(-1)  # 使用模型預測作為下一步輸入
+
         # 產生 mask
         src_mask, tgt_mask = masks(src, input_tgt, src_pad_idx, tgt_pad_idx, device=device)
 
@@ -70,8 +78,7 @@ def t_epoch(mod, it, optimizer, criterion, scheduler,src_pad_idx, tgt_pad_idx, d
         torch.nn.utils.clip_grad_norm_(mod.parameters(), 1.0)
         optimizer.step()
         if scheduler is not None:
-            if type(scheduler).__name__ != "ReduceLROnPlateau":
-                scheduler.step()
+            scheduler.step()
 
         batch_loss = loss.item()
         epoch_loss += batch_loss
@@ -283,6 +290,25 @@ def sample_and_print_examples(model, dataloader, src_vocab, tgt_vocab, device, n
 
 
 
+def custom_loss(output, target, pad_idx, unk_idx, penalty=0.5):
+    # output: (batch, seq_len, vocab_size)
+    # target: (batch, seq_len)
+    # pad_idx: padding token index
+    # unk_idx: <unk> token index
+    # penalty: penalty factor for <unk>
+
+    vocab_size = output.size(-1)
+    output = output.view(-1, vocab_size)  # (batch * seq_len, vocab_size)
+    target = target.view(-1)  # (batch * seq_len)
+
+    # Create a weight tensor for the loss
+    weight = torch.ones(vocab_size, device=output.device)
+    weight[unk_idx] = penalty  # Apply penalty to <unk>
+
+    # Compute the loss with the custom weight
+    loss = F.cross_entropy(output, target, weight=weight, ignore_index=pad_idx)
+    return loss
+
 def main():
     #準備資料
     train_loader, valid_loader, test_loader, src_vocab, tgt_vocab = build_data_loaders(data_dir=DR, batch_size=BZ)
@@ -330,7 +356,6 @@ def main():
     if os.path.exists(save_path):
         print("載入 best checkpoint 供評估...")
         eval_model, src_vocab_ckpt, tgt_vocab_ckpt = inference(path=save_path, device=DEVICE)
-        # 若你希望使用 checkpoint 的 vocab，則把 src_vocab/tgt_vocab 換成 _ckpt
         eval_src_vocab, eval_tgt_vocab = src_vocab_ckpt, tgt_vocab_ckpt
     else:
         print("未找到 checkpoint，使用目前記憶體中的 model 供評估。")
@@ -389,24 +414,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-
-'''針對 70k 資料的具體 config（建議）
-
-模型：Encoder/Decoder 各 4 層（N=4）
-
-d_model = 256，heads=8（head_dim=32）
-
-d_ff = 1024（≈4×d_model）
-
-vocab = 32k（shared or separate）
-
-dropout = 0.1，label smoothing = 0.1
-
-batch tokens ≈ 4096（用 gradient accumulation 若 VRAM 不足）
-
-optimizer = AdamW，lr schedule: warmup 4000 steps + inverse sqrt decay，peak lr ≈ 5e-4（從頭訓練）
-
-epochs：30–100（但用 validation 做 early stop）
-
-gradient clipping = 1.0
-'''

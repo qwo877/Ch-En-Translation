@@ -62,7 +62,7 @@ def yield_tokens(pairs: Iterable[Tuple[str, str]], tokenizer, which: str):
             yield tokenizer(t)
 
 
-def build_vocab(tokens_iter: Iterable[List[str]], min_freq=2, specials=SPECIALS):
+def build_vocab(tokens_iter: Iterable[List[str]], min_freq, specials=SPECIALS):
     counter = Counter()
     for toks in tokens_iter:
         counter.update(toks)

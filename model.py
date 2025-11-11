@@ -84,12 +84,19 @@ class DecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, enc_output, src_mask, tgt_mask):
+        # 初始化 Coverage Vector 為零，形狀與 attn2 一致
+        coverage_vector = torch.zeros(x.size(0), x.size(1), device=x.device)  # (batch, tgt_len)
+
         # Masked self-attn
         attn1 = self.self_attn(x, x, x, mask=tgt_mask)
         x = self.norm1(x + self.dropout(attn1))
+
         # Encoder-decoder cross-attention
         attn2 = self.cross_attn(x, enc_output, enc_output, mask=src_mask)  # src_mask used to mask encoder keys
+        coverage_vector += attn2.sum(dim=-1)  # 累加注意力分布 (batch, tgt_len)
         x = self.norm2(x + self.dropout(attn2))
+
+        # Feed-forward
         ff = self.feed_forward(x)
         x = self.norm3(x + self.dropout(ff))
         return x

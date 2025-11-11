@@ -7,7 +7,7 @@ import bz2
 import random
 import requests
 from tqdm import tqdm
-
+import re
 # ------------------ 參數 ------------------
 OUT_DIR = "data"
 SENTENCES_URL = "https://downloads.tatoeba.org/exports/sentences.csv"
@@ -19,20 +19,24 @@ LINKS_URLS = [
 # 語言代碼（Tatoeba 用 ISO639-3）— 英文是 "eng"，中文常見為 "cmn" (Mandarin)，也可能看到 "zho"
 EN_CODES = {"eng"}
 ZH_CODES = {"cmn", "zho", "chi", "cmn-Hant", "cmn-Hans"}
-MAX_PAIRS = 100_000     # 取出最多多少對
-MIN_CHAR_LEN = 1        # 最短字元數
+MAX_PAIRS = 120_000     # 取出最多多少對
+MIN_CHAR_LEN = 5        # 最短字元數
 MAX_CHAR_LEN = 300      # 最長字元數
 TRAIN_RATIO = 0.90
 VALID_RATIO = 0.05
 TEST_RATIO = 0.05
 RANDOM_SEED = 42
+REMOVE_UNK = True
 # ----------------------------------------------
 
 os.makedirs(OUT_DIR, exist_ok=True)
 TMP_DIR = "tmp_tatoeba"
 os.makedirs(TMP_DIR, exist_ok=True)
 
-def download_stream(url, out_path, desc=None):
+def normal(s: str):
+    return not bool(re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", s))
+
+def dow_s(url, out_path, desc=None):
     print(f"下載：{url}")
     r = requests.get(url, stream=True, timeout=60)
     if r.status_code != 200:
@@ -45,18 +49,8 @@ def download_stream(url, out_path, desc=None):
                 pbar.update(len(chunk))
     return out_path
 
-def try_download_links():
-    # 嘗試 links.csv、links.csv.bz2、links.tar.bz2 等
-    for url in LINKS_URLS:
-        try:
-            outfn = os.path.join(TMP_DIR, os.path.basename(url))
-            download_stream(url, outfn)
-            return outfn
-        except Exception as e:
-            print(f"嘗試 {url} 失敗：{e}")
-    raise RuntimeError("無法下載 links 檔案，請檢查網路或網址。")
 
-def extract_if_bz2_or_tar(path):
+def extract(path):
     # 如果是 .bz2、.tar.bz2、.tar 等，嘗試解壓並回傳解出的 links 檔完整路徑
     lp = path.lower()
     if lp.endswith(".tar.bz2") or lp.endswith(".tar.bz2"):
@@ -79,13 +73,15 @@ def extract_if_bz2_or_tar(path):
         # 不是壓縮檔，直接回傳
         return path
 
-def load_sentences(sentences_csv_path, keep_langs):
-    print("解析 sentences.csv（只保留指定語言以節省記憶體）...")
+def load_s(sentences_csv_path, keep_langs):
+    print("解析 sentences.csv")
     mapping = {}
-    # sentences.csv 每行: id \t lang \t text
+    removed_cnt = 0
+    total = 0
     with open(sentences_csv_path, "r", encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f, delimiter="\t")
         for row in tqdm(reader, desc="讀 sentences", unit="line"):
+            total += 1
             if len(row) < 3:
                 continue
             sid = row[0].strip()
@@ -94,17 +90,25 @@ def load_sentences(sentences_csv_path, keep_langs):
             if not sid or not lang:
                 continue
             if lang in keep_langs:
+                # 濾掉明顯有 <unk> 的句子（大寫/小寫都算）
+                if REMOVE_UNK and ("<unk>" in text or "<UNK>" in text):
+                    removed_cnt += 1
+                    continue
+                if not normal(text):
+                    removed_cnt += 1
+                    continue
                 try:
                     mapping[int(sid)] = (lang, text)
                 except:
                     continue
-    print(f"保留句子數（指定語言）: {len(mapping)}")
+    print(f"保留句子數（指定語言）: {len(mapping)}；總讀入行數: {total}；移除: {removed_cnt}")
     return mapping
 
-def load_links(links_csv_path, sentences_map, max_pairs=None):
-    print("解析 links.csv 並抽取英中平行句對...")
+def load_l(links_csv_path, sentences_map, max_pairs=None):
+    print("解析 links.csv 並抽取英中平行句對")
     pairs = []
     seen = set()
+    removed_pair_counts = {"missing":0, "bad_len":0, "contains_unk":0}
     with open(links_csv_path, "r", encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f, delimiter="\t")
         for row in tqdm(reader, desc="讀 links", unit="line"):
@@ -115,6 +119,7 @@ def load_links(links_csv_path, sentences_map, max_pairs=None):
             except:
                 continue
             if a not in sentences_map or b not in sentences_map:
+                removed_pair_counts["missing"] += 1
                 continue
             la, ta = sentences_map[a]
             lb, tb = sentences_map[b]
@@ -124,12 +129,22 @@ def load_links(links_csv_path, sentences_map, max_pairs=None):
                     en, zh = ta, tb
                 else:
                     en, zh = tb, ta
-                # 基本清理
                 en = en.strip()
                 zh = zh.strip()
+                # 過濾控制字元或太長/太短
                 if len(en) < MIN_CHAR_LEN or len(zh) < MIN_CHAR_LEN:
+                    removed_pair_counts["bad_len"] += 1
                     continue
                 if len(en) > MAX_CHAR_LEN or len(zh) > MAX_CHAR_LEN:
+                    removed_pair_counts["bad_len"] += 1
+                    continue
+                # 如果任一邊包含 "<unk>" 則完全跳過（使用者要求）
+                if REMOVE_UNK and ("<unk>" in en or "<UNK>" in en or "<unk>" in zh or "<UNK>" in zh):
+                    removed_pair_counts["contains_unk"] += 1
+                    continue
+                # 再檢查是否含控制字元
+                if not normal(en) or not normal(zh):
+                    removed_pair_counts["bad_len"] += 1
                     continue
                 # 去重與去掉完全相同內容
                 key = (en, zh)
@@ -139,10 +154,11 @@ def load_links(links_csv_path, sentences_map, max_pairs=None):
                 pairs.append((en, zh))
                 if max_pairs and len(pairs) >= max_pairs:
                     break
-    print(f"抽出平行句對數: {len(pairs)}")
+    print(f"抽出平行句對數: {len(pairs)}；被移除的 pairs: {removed_pair_counts}")
     return pairs
 
-def split_and_write(pairs, out_dir, train_ratio=0.90, valid_ratio=0.05, test_ratio=0.05):
+def split_write(pairs, out_dir, train_ratio=0.90, valid_ratio=0.05, test_ratio=0.05):
+    os.makedirs(out_dir, exist_ok=True)
     print("shuffle 並切分資料集...")
     random.seed(RANDOM_SEED)
     random.shuffle(pairs)
@@ -154,12 +170,11 @@ def split_and_write(pairs, out_dir, train_ratio=0.90, valid_ratio=0.05, test_rat
     test = pairs[n_train+n_valid:]
     print(f"train={len(train)}, valid={len(valid)}, test={len(test)}")
     def write_split(lst, prefix):
-        fe = open(os.path.join(out_dir, f"{prefix}.en"), "w", encoding="utf-8")
-        fz = open(os.path.join(out_dir, f"{prefix}.zh"), "w", encoding="utf-8")
-        for en, zh in lst:
-            fe.write(en.replace("\n"," ") + "\n")
-            fz.write(zh.replace("\n"," ") + "\n")
-        fe.close(); fz.close()
+        with open(os.path.join(out_dir, f"{prefix}.en"), "w", encoding="utf-8", newline="\n") as fe, \
+             open(os.path.join(out_dir, f"{prefix}.zh"), "w", encoding="utf-8", newline="\n") as fz:
+            for en, zh in lst:
+                fe.write(en.replace("\n"," ") + "\n")
+                fz.write(zh.replace("\n"," ") + "\n")
     write_split(train, "train")
     write_split(valid, "valid")
     write_split(test, "test")
@@ -170,7 +185,7 @@ def main():
         # 下載 sentences.csv
         sentences_local = os.path.join(TMP_DIR, "sentences.csv")
         if not os.path.exists(sentences_local):
-            download_stream(SENTENCES_URL, sentences_local, desc="sentences.csv")
+            dow_s(SENTENCES_URL, sentences_local, desc="sentences.csv")
         else:
             print("已存在 sentences.csv，略過下載。")
 
@@ -183,34 +198,34 @@ def main():
                     links_local = fname
                     print(f"已存在 {fname}，略過下載。")
                     break
-                download_stream(url, fname, desc=os.path.basename(url))
+                dow_s(url, fname, desc=os.path.basename(url))
                 links_local = fname
                 break
             except Exception as e:
                 print(f"下載失敗：{url}，錯誤：{e}")
                 continue
         if links_local is None:
-            raise RuntimeError("無法下載 links 檔案，請手動檢查網址或網路。")
+            raise RuntimeError("無法下載 links 檔案，檢查網址或網路。")
 
         # 解壓
-        links_csv = extract_if_bz2_or_tar(links_local)
+        links_csv = extract(links_local)
 
         # 解析 sentences
         keep_langs = set()
         keep_langs.update(EN_CODES)
         keep_langs.update(ZH_CODES)
-        sentences_map = load_sentences(sentences_local, keep_langs)
+        sentences_map = load_s(sentences_local, keep_langs)
 
         # 解析 links 並抽對 (最多 MAX_PAIRS)
-        pairs = load_links(links_csv, sentences_map, max_pairs=MAX_PAIRS)
+        pairs = load_l(links_csv, sentences_map, max_pairs=MAX_PAIRS)
 
         if len(pairs) == 0:
-            raise RuntimeError("找不到任何平行句對。請檢查 sentences/links 是否為最新版本、或語言代碼是否正確。")
+            raise RuntimeError("找不到任何平行句對。")
 
         # 切分並寫檔
-        split_and_write(pairs, OUT_DIR, TRAIN_RATIO, VALID_RATIO, TEST_RATIO)
+        split_write(pairs, OUT_DIR, TRAIN_RATIO, VALID_RATIO, TEST_RATIO)
 
-        print("完成！請用你的 read_parallel / build_data_loaders 直接讀取 data/ 目錄中的檔案。")
+        print("OK")
     finally:
         # 清理 tmp
         print("清理暫存檔...")
